@@ -17,16 +17,17 @@ A lubricant manufacturing company operates across **22 business units** (1 facto
 
 ### 1. Semantic Layer (SQL Views)
 
-Designed **6 analytical views** that transform raw ERP tables into clean, business-ready datasets:
+Designed **7 SQL queries** that transform raw ERP tables into clean, business-ready datasets:
 
 | View | Purpose | Key Logic |
 |---|---|---|
 | `vw_dim_empresa` | Company dimension with classification | Joins master + custom classification (factory/branch/distributor) |
 | `vw_fechamento_vendas` | Sales fact table | Triple-check anti-duplication filter (CFOP whitelist + cancel filter + inter-company exclusion) |
-| `vw_fechamento_pedidos` | Orders with backlog | Calculates open-to-invoice qty, includes margin data from CRM |
+| `vw_fechamento_pedidos` | Orders with backlog | Calculates open-to-invoice qty, includes margin data from CRM; real entry dates sourced from `crm_audit` (overwrite-safe) |
 | `vw_fechamento_estoque` | Live inventory by lot | Enriched with real production date (derived from first production posting) |
 | `vw_fechamento_apontamentos` | Production postings | Replaces legacy character-mode report (PRD0157) |
 | `vw_fechamento_clientes` | Customer dimension | Dynamic status (Active/At Risk/Inactive based on days since last purchase) + ABC classification |
+| `vw_dim_item` | Product dimension | Joins `item`, `linha_prod`, `familia`, and `peso_especifico`; `familia` table needed for Lubricants vs. Coolants split |
 
 **Anti-duplication filter** (critical business rule):
 ```sql
@@ -87,6 +88,14 @@ Reverse-engineered all 20 fiscal operation codes used in 2026 and classified the
 | 11 | SCRAP SALE | Yes | 13 / $1.2M |
 | 13 | EXPORT | Yes | 2 / $538K |
 
+### 6. Real Order Entry Dates via Audit Log
+
+Discovered that `crm_pedido.dat_emis_pedido` is overwritten every time an order is edited in the ERP — making it useless for "when did this order arrive?" analysis. Found that the `crm_audit` table (the ERP's internal change log) records a reliable `'pedido criado'` event at creation time. Rewrote the orders query to join `crm_audit` twice (once for creation event, once for quote→order conversion) and use `COALESCE(data_criacao, data_conversao)` as the authoritative entry date. Validated result matched the team's manual Excel reference to the day.
+
+### 7. Daily Snapshot Script for Point-in-Time KPIs
+
+Designed a Python snapshot concept that runs each morning before the BI is opened, querying live stock and backlog from the ERP and appending a row to a CSV file. This enables KPI cards showing "stock as of today" without requiring the BI to do expensive real-time queries, and accumulates a historical series for trend charts. Data is written as integers (no decimal point) to avoid locale-parsing issues in Brazilian Portuguese Power BI installations.
+
 ### 5. Liters Conversion Discovery
 
 The ERP stores **liters per package** in a field originally designed for **specific gravity** (density). This is a local adaptation — the field `val_pes_espec` in the `peso_especifico` table stores `20` for a 20L pail (not `0.87 kg/L` as the field name suggests).
@@ -110,13 +119,14 @@ The ERP stores **liters per package** in a field originally designed for **speci
 
 ```
 sql/
-  views/           — Analytical views (SELECT statements for PBI import)
+  views/           — 7 SQL queries (SELECT statements for PBI import)
   investigations/  — Ad-hoc investigation queries (inventory, lead time)
   dimensions/      — Dimension queries (company, customer, product)
 docs/
-  architecture.md  — System architecture and data flow
-  gotchas.md       — ERP-specific pitfalls and workarounds
-  cfop-mapping.md  — Fiscal operation code classification
+  architecture.md     — System architecture and data flow
+  gotchas.md          — ERP-specific pitfalls and workarounds (~20 entries)
+  cfop-mapping.md     — Fiscal operation code classification
+  corrections-log.md  — 8 documented bugs found and fixed during the build
 analysis/
   inventory-ghost/ — Phantom stock investigation results
   lead-time/       — Approval workflow analysis
@@ -133,6 +143,10 @@ analysis/
 4. **Inter-company transfers are the #1 source of revenue double-counting** in multi-branch setups. A CFOP whitelist + client exclusion list is more reliable than blacklisting specific operation codes.
 
 5. **Warehouse address vs. location are different concepts** — `cod_local = 'EXPED'` (location) with `endereco = 'PRD'` (address) means "physically in expedition area but logically in production buffer."
+
+6. **`crm_audit` is the source of truth for order dates** — editable date fields (`dat_emis_pedido`) get overwritten on every save. The audit log is append-only and preserves the original creation timestamp.
+
+7. **`familia` table is required for product family segmentation** — `linha_prod` only exposes a generic category. The `familia` table (also multi-company, requiring a `GROUP BY` subquery) provides the Lubricants vs. Coolants vs. other segment split needed for business reporting.
 
 ## Author
 

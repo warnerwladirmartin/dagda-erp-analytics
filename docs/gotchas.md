@@ -82,3 +82,88 @@ If querying the secondary ERP (SAP B1 on HANA), the invoice number is **`OINV.Se
 | `INV+`/`INV-` | Inventory adjustment | Program: `ENT1661` |
 
 Movement type flag: `N` = Normal, `R` = Reversal/Cancellation.
+
+## 11. Order Entry Dates Are Overwritten on Edit
+
+`crm_pedido.dat_emis_pedido` and `dat_emis_repres` are **overwritten every time an order is edited** — they do not represent the real entry date. To get the true order creation date, query the `crm_audit` log table:
+
+```sql
+-- Real creation date: when audit logged 'pedido criado'
+SELECT
+    substring(chave,1,2)                    AS cod_empresa,
+    rtrim(ltrim(substring(chave,4,6)))::int  AS num_pedido,
+    MIN(datahora)::date                      AS data_pedido
+FROM crm_audit
+WHERE nom_tabela = 'CRM_PEDIDO'
+  AND campo      = 'AUDITMSG'
+  AND lower(new_val) LIKE '%pedido%criado%'
+GROUP BY substring(chave,1,2), rtrim(ltrim(substring(chave,4,6)))::int
+```
+
+Use `COALESCE(data_pedido, data_conversao)` where `data_conversao` is the moment `ies_tipo` changed to `'P'` (quote converted to order).
+
+## 12. `linha_prod` Has No `cod_empresa` Column
+
+Unlike most master tables, `linha_prod` is not scoped by company. A direct JOIN can cause silent cartesian products if there are duplicate `cod_lin_prod` values across loaded data. Always use a subquery with `GROUP BY` and `MAX()`:
+
+```sql
+LEFT JOIN (
+    SELECT cod_lin_prod, MAX(den_estr_linprod) AS den_estr_linprod
+    FROM linha_prod
+    GROUP BY cod_lin_prod
+) lp ON lp.cod_lin_prod = i.cod_lin_prod
+```
+
+## 13. `peso_especifico` Has One Row per Company (22 rows per item)
+
+The `peso_especifico` table stores the liters-per-package value per company. A join without a company filter multiplies every row by 22, silently inflating all liter totals. Always fix to a single company:
+
+```sql
+LEFT JOIN peso_especifico pe
+  ON pe.cod_empresa = '01'    -- fix to the producing company
+ AND pe.cod_item    = e.cod_item
+```
+
+## 14. `familia` Table Also Has 22 Rows per Family
+
+Same issue as `peso_especifico` — the `familia` table has one row per `(cod_empresa, cod_familia)`. To get a unique family description, use a subquery:
+
+```sql
+LEFT JOIN (
+    SELECT cod_empresa, cod_familia, MAX(den_familia) AS den_familia
+    FROM familia GROUP BY cod_empresa, cod_familia
+) fam ON fam.cod_empresa = cp.cod_empresa
+     AND fam.cod_familia  = i.cod_familia
+```
+
+Use `familia` for Lubricants vs. Coolants classification — `linha_prod` only contains a generic "GENERAL" category and cannot distinguish product families.
+
+## 15. `ies_suspenso` and `ies_sit_pedido` Are Two Separate Fields
+
+Suspended orders (`ies_suspenso = 'S'`) are an internal process that duplicates orders — they must be excluded. `ies_sit_pedido` is a different field representing billing status. Both need to be checked independently; filtering on only one will still produce inflated totals.
+
+## 16. Do Not Filter `ies_sit_pedido` When Measuring Order Intake
+
+Filtering by `ies_sit_pedido` to keep only "open" orders will exclude orders already fulfilled or cancelled — which means they disappear from the historical entry chart. For "Entrada de Pedidos" (order intake over time), include all statuses and rely only on `data_pedido` from `crm_audit`.
+
+## 17. `ies_tipo` Is the Correct Field for Order vs. Quote
+
+The field to distinguish quotes from orders is `ies_tipo` (values: `'O'` = orcamento/quote, `'P'` = pedido/order). The field `ies_tip_pedido` is a different attribute (order type classification) and should not be confused with it.
+
+## 18. Stock Query Must Filter `cod_local = 'EXPED'` and Specific Addresses
+
+Without `cod_local = 'EXPED'`, the stock query picks up locations like `DEVOL` (returns) and `IC` (inter-company), inflating finished goods stock. Within `EXPED`, further filter `endereco IN ('BLC.01', 'PRD')` to exclude `AVA` (damaged), `CON` (consigned), and `REC` (receiving). Missing these two filters was responsible for ~130K liters of phantom stock.
+
+## 19. Finished Goods Stock Includes Type `B` (Beneficiado)
+
+`ies_tip_item = 'F'` (Fabricado) alone misses items classified as `'B'` (Beneficiado/toll-manufactured), which are part of the real finished goods inventory. Use `ies_tip_item IN ('F', 'B')` for stock and production queries.
+
+## 20. ICONIC Items Need a Separate Packaging Category
+
+Items with "ICONIC" in their product line name have unit of measure `CX` (box) but represent a premium package that must be tracked separately. Create a calculated column in Power BI to detect them:
+
+```dax
+embalagem_cat = IF(SEARCH("ICONIC", fat_apontamentos[linha_produto], 1, 0) > 0,
+                   "ICONIC",
+                   fat_apontamentos[un])
+```
