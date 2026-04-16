@@ -48,7 +48,7 @@ The `pedido` table (73 columns) is **completely empty**. Real orders live in `cr
 
 ## 6. Customer PK is the Tax ID (CNPJ)
 
-`clientes.cod_cliente` is the formatted CNPJ (`038248576000226`), not a sequential number. Each group company also has a customer record — this is how inter-company invoices work. The `empresa.cod_cliente` field points to the company's "mirror" customer.
+`clientes.cod_cliente` is the formatted CNPJ (`01234567890123`), not a sequential number. Each group company also has a customer record — this is how inter-company invoices work. The `empresa.cod_cliente` field points to the company's "mirror" customer.
 
 ## 7. Warehouse Location vs. Address
 
